@@ -1,2 +1,4 @@
 gdowm
 discord
+spotify 
+yt-dlp
