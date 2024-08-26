@@ -1,72 +1,180 @@
-import os
+import discord
 from discord.ext import commands
-from discord import app_commands 
-from collections import defaultdict
-import discord  
-import gdown
+from discord import app_commands
+import yt_dlp as youtube_dl
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+import asyncio
+import re
 
-intents = discord.Intents.all()
-intents.messages = True
+# Setup bot with intents
+intents = discord.Intents.default()
+intents.message_content = True
 intents.guilds = True
-intents.members = True
+intents.guild_messages = True
+intents.voice_states = True
 
-bot = commands.Bot(command_prefix="x", intents=discord.Intents.all())
+bot = commands.Bot(intents=intents)
 
-@bot.tree.command(name="ping")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message(f"Hey {interaction.user.mention}! My latency is {round(bot.latency * 1000)}ms",
-        ephemeral=True)
+# Spotify credentials
+sp = spotipy.Spotify(auth_manager=SpotifyClientCredentials(client_id='YOUR_SPOTIPY_CLIENT_ID',
+                                                           client_secret='YOUR_SPOTIPY_CLIENT_SECRET'))
 
-@bot.tree.command(name="say", description="Want to say something? to someone,say with the help of this")
-@app_commands.describe(thing_to_say="synced")
-async def say(interaction: discord.Interaction, thing_to_say: str,
-            to: discord.Member):
-  await interaction.response.send_message(
-      f"{interaction.user.mention} said: `{thing_to_say}` to '{to.mention}'")
+# Music related variables
+queues = {}
 
-bad_words = ["chutiya", "lodu","fuck", "maderchod", "madarchod", "madarchoda", "madarchod", "madarchod","bhenchod", "bhenchoda", "bhenchod", "bhenchod", "bsdk", "chutiya",
-        "chutiye", "chutiye", "chutiya", "betichod", "betichoda", "betichod",
-        "betichoda", "gandu", "chut", "lund"]  
-user_levels = defaultdict(int)
-user_xp = defaultdict(int)
-spam_tracker = defaultdict(list)
+# Function to extract audio URL from a YouTube link
+def get_youtube_url(search_query):
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'noplaylist': True,
+        'quiet': True,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+    }
+
+    with youtube_dl.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(search_query, download=False)
+        return info['formats'][0]['url']
+
+class Music(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @app_commands.command(name="join", description="Join the voice channel")
+    async def join(self, interaction: discord.Interaction):
+        if interaction.user.voice:
+            channel = interaction.user.voice.channel
+            await channel.connect()
+            await interaction.response.send_message(f'Joined {channel}')
+        else:
+            await interaction.response.send_message('You are not in a voice channel!')
+
+    @app_commands.command(name="leave", description="Leave the voice channel")
+    async def leave(self, interaction: discord.Interaction):
+        if interaction.guild.voice_client:
+            await interaction.guild.voice_client.disconnect()
+            await interaction.response.send_message('Left the voice channel!')
+        else:
+            await interaction.response.send_message('I am not in a voice channel!')
+
+    @app_commands.command(name="play", description="Play a track from YouTube or Spotify")
+    @app_commands.describe(url="The URL of the track to play")
+    async def play(self, interaction: discord.Interaction, url: str):
+        if interaction.guild.voice_client is None:
+            if interaction.user.voice:
+                channel = interaction.user.voice.channel
+                await channel.connect()
+            else:
+                await interaction.response.send_message('You are not in a voice channel!')
+                return
+
+        voice_client = interaction.guild.voice_client
+        if 'spotify.com' in url:
+            track_id = re.search(r'spotify\.com/track/(\w+)', url).group(1)
+            track = sp.track(track_id)
+            track_name = track['name']
+            track_url = track['external_urls']['spotify']
+
+            search_query = f"{track_name} {track['artists'][0]['name']}"
+            youtube_url = get_youtube_url(search_query)
+
+            voice_client.stop()
+            voice_client.play(discord.FFmpegPCMAudio(youtube_url, **{'options': '-vn'}))
+            await interaction.response.send_message(f'Now playing: {track_name} by {track["artists"][0]["name"]}')
+        elif url.startswith('https://www.youtube.com/') or url.startswith('https://youtu.be/'):
+            youtube_url = get_youtube_url(url)
+            voice_client.stop()
+            voice_client.play(discord.FFmpegPCMAudio(youtube_url, **{'options': '-vn'}))
+            await interaction.response.send_message(f'Now playing: {url}')
+        else:
+            await interaction.response.send_message('Unsupported URL. Please provide a valid YouTube or Spotify URL.')
+
+    @app_commands.command(name="pause", description="Pause the current track")
+    async def pause(self, interaction: discord.Interaction):
+        if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
+            interaction.guild.voice_client.pause()
+            await interaction.response.send_message('Playback paused.')
+        else:
+            await interaction.response.send_message('No music is currently playing.')
+
+    @app_commands.command(name="resume", description="Resume the current track")
+    async def resume(self, interaction: discord.Interaction):
+        if interaction.guild.voice_client and interaction.guild.voice_client.is_paused():
+            interaction.guild.voice_client.resume()
+            await interaction.response.send_message('Playback resumed.')
+        else:
+            await interaction.response.send_message('Music is not paused.')
+
+    @app_commands.command(name="skip", description="Skip the current track")
+    async def skip(self, interaction: discord.Interaction):
+        if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
+            interaction.guild.voice_client.stop()
+            await interaction.response.send_message('Skipped the current song.')
+        else:
+            await interaction.response.send_message('No music is currently playing.')
+
+    @app_commands.command(name="queue", description="Queue a track from YouTube or Spotify")
+    @app_commands.describe(url="The URL of the track to queue")
+    async def queue(self, interaction: discord.Interaction, url: str):
+        if interaction.guild.voice_client is None:
+            if interaction.user.voice:
+                channel = interaction.user.voice.channel
+                await channel.connect()
+            else:
+                await interaction.response.send_message('You are not in a voice channel!')
+                return
+
+        if interaction.guild.id not in queues:
+            queues[interaction.guild.id] = []
+
+        if 'spotify.com' in url:
+            track_id = re.search(r'spotify\.com/track/(\w+)', url).group(1)
+            track = sp.track(track_id)
+            track_name = track['name']
+            track_url = track['external_urls']['spotify']
+
+            search_query = f"{track_name} {track['artists'][0]['name']}"
+            youtube_url = get_youtube_url(search_query)
+
+            queues[interaction.guild.id].append(youtube_url)
+            await interaction.response.send_message(f'Added to queue: {track_name} by {track["artists"][0]["name"]}')
+
+            if not interaction.guild.voice_client.is_playing():
+                await self.play_next(interaction)
+        elif url.startswith('https://www.youtube.com/') or url.startswith('https://youtu.be/'):
+            youtube_url = get_youtube_url(url)
+            queues[interaction.guild.id].append(youtube_url)
+            await interaction.response.send_message(f'Added to queue: {url}')
+
+            if not interaction.guild.voice_client.is_playing():
+                await self.play_next(interaction)
+        else:
+            await interaction.response.send_message('Unsupported URL. Please provide a valid YouTube or Spotify URL.')
+
+    async def play_next(self, interaction: discord.Interaction):
+        if interaction.guild.id in queues and queues[interaction.guild.id]:
+            url = queues[interaction.guild.id].pop(0)
+            interaction.guild.voice_client.play(discord.FFmpegPCMAudio(url, **{'options': '-vn'}),
+                                                after=lambda e: asyncio.run_coroutine_threadsafe(self.play_next(interaction), bot.loop))
+            await interaction.response.send_message('Now playing the next song in the queue.')
+
+    @app_commands.command(name="volume", description="Set the volume of the current track")
+    @app_commands.describe(volume="The volume percentage (0-100)")
+    async def volume(self, interaction: discord.Interaction, volume: int):
+        if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
+            interaction.guild.voice_client.source.volume = volume / 100
+            await interaction.response.send_message(f'Volume set to {volume}%.')
+        else:
+            await interaction.response.send_message('No music is currently playing.')
 
 @bot.event
-async def on_message(message):
-        if message.author == bot.user:
-            return
-
-        # Check for bad words
-        if any(word in message.content.lower() for word in bad_words):
-            await message.delete()
-            await message.channel.send(f"{message.author.mention}, please avoid using bad language!")
-            return
-
-        # Check for spam
-        now = message.created_at.timestamp()
-        spam_tracker[message.author.id].append(now)
-        spam_tracker[message.author.id] = [t for t in spam_tracker[message.author.id] if now - t < 10]
-        if len(spam_tracker[message.author.id]) > 5:
-            await message.delete()
-            await message.channel.send(f"{message.author.mention}, please do not spam!")
-            return
-
-@bot.command()
-async def mute(ctx, member: discord.Member, *, reason=None):
-        mute_role = discord.utils.get(ctx.guild.roles, name="Muted")
-        if not mute_role:
-            mute_role = await ctx.guild.create_role(name="Muted")
-            for channel in ctx.guild.channels:
-                await channel.set_permissions(mute_role, speak=False, send_messages=False)
-        await member.add_roles(mute_role, reason=reason)
-        await ctx.send(f"{member.mention} has been muted.")
-
-@bot.command()
-async def leaderboard(ctx):
-        sorted_users = sorted(user_levels.items(), key=lambda x: x[1], reverse=True)
-        leaderboard = "\n".join([f"<@{user_id}> - Level {level}" for user_id, level in sorted_users[:10]])
-        await ctx.send(f"Leaderboard:\n{leaderboard}")
-
+async def on_ready():
+    await bot.tree.sync()  # Sync the commands with Discord
+    print(f'Logged in as {bot.user.name}')
 
 url = 'https://drive.google.com/u/0/uc?id=1F3ZGuaKN4ugYe_K1k9jLpAndTrNUvyWs'
 output = 'token.txt'
